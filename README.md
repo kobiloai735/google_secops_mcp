@@ -333,14 +333,26 @@ principal.user.userid = "jsmith"
 
 ## 🔄 שחזור מהיר | Quick Recovery Checklist
 
+### פקודות שחזור מלאות | Full Recovery Commands
+```bash
+git clone https://github.com/kobiloai735/google_secops_mcp.git
+cd google_secops_mcp
+pip install -r requirements.txt
+cp .env.example .env  # מלא credentials
+python dashboard.py
 ```
-□ 1. git clone [repo-url]
-□ 2. pip install -r requirements.txt
-□ 3. cp .env.example .env && nano .env   # fill in credentials
-□ 4. gcloud auth application-default login
-□ 5. python dashboard.py
-□ 6. פתח http://127.0.0.1:5001
-□ 7. לחץ "Connection Test" → "Run Analysis" לאימות חיבור
+
+### רשימת תיוג | Step-by-Step Checklist
+```
+□ 1. git clone https://github.com/kobiloai735/google_secops_mcp.git
+□ 2. cd google_secops_mcp
+□ 3. pip install -r requirements.txt
+□ 4. cp .env.example .env
+□ 5. ערוך .env — מלא SECOPS_PROJECT_ID, SECOPS_INSTANCE_ID, SECOPS_REGION
+□ 6. gcloud auth application-default login
+□ 7. python dashboard.py
+□ 8. פתח http://127.0.0.1:5001
+□ 9. לחץ "Connection Test" → "Run Analysis" לאימות חיבור
 ```
 
 ---
