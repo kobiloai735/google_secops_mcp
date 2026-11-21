@@ -25,7 +25,8 @@ from google.oauth2 import service_account
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
-load_dotenv()
+# .env next to this file, whatever the working directory (e.g. when launched by Claude Code)
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -63,11 +64,17 @@ def _headers() -> dict:
     }
 
 
+def _api_url(endpoint: str) -> str:
+    """Build the API URL. An endpoint starting with ':' is a method on the instance itself."""
+    sep = "" if endpoint.startswith(":") else "/"
+    return f"{BASE_URL}/v1alpha/{INSTANCE_PATH}{sep}{endpoint}"
+
+
 def _request(method: str, endpoint: str,
              payload: Optional[dict] = None,
              params: Optional[dict] = None) -> dict:
     """Execute an authenticated API call and return parsed JSON."""
-    url = f"{BASE_URL}/v1alpha/{INSTANCE_PATH}/{endpoint}"
+    url = _api_url(endpoint)
     resp = requests.request(method, url,
                             headers=_headers(),
                             json=payload,
@@ -201,9 +208,11 @@ def secops_validate_rule(rule_text: str) -> dict:
         rule_text: YARA-L 2.0 rule source to validate.
 
     Returns:
-        Dict with 'success' bool and 'errors' list (if any).
+        Dict with 'success': true if the rule compiles. On a compile error
+        'success' is absent and 'compilationDiagnostics' lists message,
+        position and severity.
     """
-    return _request("POST", "rules:verifyRule", {"rule": {"text": rule_text}})
+    return _request("POST", ":verifyRuleText", {"ruleText": rule_text})
 
 
 @mcp.tool()
@@ -323,6 +332,317 @@ def secops_list_reference_lists(page_size: int = 50) -> dict:
     """
     return _request("GET", "referenceLists", params={"pageSize": page_size})
 
+
+# ── Retrohunts ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def secops_create_retrohunt(
+    rule_id: str,
+    start_time: str = "",
+    end_time: str = "",
+    hours_back: int = 168,
+) -> dict:
+    """
+    Run an existing YARA-L rule against historical data (retrohunt).
+    Use this to discover threats that were missed when the rule didn't exist yet.
+
+    Args:
+        rule_id:    Rule ID to retrohunt with (e.g. "ru_xxxxxxxx-...").
+        start_time: ISO-8601 UTC start (e.g. "2024-01-01T00:00:00Z").
+        end_time:   ISO-8601 UTC end   (e.g. "2024-01-08T00:00:00Z").
+        hours_back: Lookback window if start/end not given (default 168 = 7 days).
+
+    Returns:
+        Created retrohunt object with id and state.
+    """
+    if not start_time:
+        start_time = _iso_ago(hours_back)
+    if not end_time:
+        end_time = _iso_now()
+
+    return _request("POST", f"rules/{rule_id}/retrohunts", {
+        "retrohuntStartTime": start_time,
+        "retrohuntEndTime": end_time,
+    })
+
+
+@mcp.tool()
+def secops_get_retrohunt(rule_id: str, retrohunt_id: str) -> dict:
+    """
+    Get the status and results of a specific retrohunt.
+
+    Args:
+        rule_id:      Rule ID the retrohunt belongs to.
+        retrohunt_id: Retrohunt ID (e.g. "oh_xxxxxxxx-...").
+
+    Returns:
+        Retrohunt object with state, progressPercentage, and retrohuntStartTime/EndTime.
+    """
+    return _request("GET", f"rules/{rule_id}/retrohunts/{retrohunt_id}")
+
+
+@mcp.tool()
+def secops_list_retrohunts(rule_id: str, page_size: int = 50) -> dict:
+    """
+    List all retrohunts for a given rule.
+
+    Args:
+        rule_id:   Rule ID to list retrohunts for.
+        page_size: Max results to return (default 50).
+
+    Returns:
+        Dict with 'retrohunts' list.
+    """
+    return _request("GET", f"rules/{rule_id}/retrohunts",
+                    params={"pageSize": page_size})
+
+
+# ── Reference Lists CRUD ──────────────────────────────────────────────────────
+
+@mcp.tool()
+def secops_create_reference_list(
+    name: str,
+    lines: list,
+    description: str = "",
+    syntax_type: str = "PLAIN_TEXT_STRING",
+) -> dict:
+    """
+    Create a new reference list (allowlist / blocklist / IOC list).
+
+    Args:
+        name:        Unique name for the list (e.g. "malicious_ips").
+        lines:       List of string entries (e.g. ["1.2.3.4", "5.6.7.8"]).
+        description: Human-readable description.
+        syntax_type: "PLAIN_TEXT_STRING" (default), "CIDR", or "REGEX".
+
+    Returns:
+        Created reference list object with name and entry count.
+    """
+    return _request("POST", "referenceLists", {
+        "name": name,
+        "description": description,
+        "lines": lines,
+        "syntaxType": syntax_type,
+    })
+
+
+@mcp.tool()
+def secops_update_reference_list(
+    list_id: str,
+    lines: list,
+    description: str = "",
+) -> dict:
+    """
+    Replace the entries of an existing reference list (full overwrite).
+
+    Args:
+        list_id:     Reference list ID or name.
+        lines:       New list of string entries (replaces existing entries).
+        description: Updated description (leave empty to keep existing).
+
+    Returns:
+        Updated reference list object.
+    """
+    body: dict = {"lines": lines}
+    if description:
+        body["description"] = description
+    return _request("PATCH", f"referenceLists/{list_id}", body)
+
+
+@mcp.tool()
+def secops_delete_reference_list(list_id: str) -> dict:
+    """
+    Delete a reference list permanently.
+
+    Args:
+        list_id: Reference list ID or name.
+
+    Returns:
+        Empty dict on success.
+    """
+    return _request("DELETE", f"referenceLists/{list_id}")
+
+
+# ── Cases (SOAR) ─────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def secops_list_cases(
+    page_size: int = 50,
+    state_filter: str = "",
+    priority_filter: str = "",
+) -> dict:
+    """
+    List security cases (SOAR incidents) in the SecOps instance.
+
+    Args:
+        page_size:       Max cases to return (default 50).
+        state_filter:    Filter by state: "OPEN", "CLOSED", or "" for all.
+        priority_filter: Filter by priority: "LOW", "MEDIUM", "HIGH", "CRITICAL".
+
+    Returns:
+        Dict with 'cases' list; each case has id, displayId, name, priority, stage, etc.
+    """
+    params: dict = {"pageSize": page_size}
+    filters = []
+    if state_filter:
+        filters.append(f"state = \"{state_filter}\"")
+    if priority_filter:
+        filters.append(f"priority = \"{priority_filter}\"")
+    if filters:
+        params["filter"] = " AND ".join(filters)
+    return _request("GET", "cases", params=params)
+
+
+@mcp.tool()
+def secops_get_case(case_id: str) -> dict:
+    """
+    Retrieve full details of a specific security case.
+
+    Args:
+        case_id: Case ID (e.g. "cases/1234" or just "1234").
+
+    Returns:
+        Full case object with alerts, entities, comments, timeline, and SLA info.
+    """
+    cid = case_id.replace("cases/", "")
+    return _request("GET", f"cases/{cid}")
+
+
+@mcp.tool()
+def secops_update_case(
+    case_id: str,
+    priority: str = "",
+    stage: str = "",
+    assignee: str = "",
+    name: str = "",
+) -> dict:
+    """
+    Update a case's priority, stage, assignee, or display name.
+
+    Args:
+        case_id:  Case ID.
+        priority: "LOW", "MEDIUM", "HIGH", or "CRITICAL".
+        stage:    Stage name (e.g. "Investigation", "Containment", "Eradication").
+        assignee: Analyst email to assign the case to.
+        name:     New display name for the case.
+
+    Returns:
+        Updated case object.
+    """
+    body: dict = {}
+    update_mask = []
+    if priority:
+        body["priority"] = priority
+        update_mask.append("priority")
+    if stage:
+        body["stage"] = stage
+        update_mask.append("stage")
+    if assignee:
+        body["assignee"] = assignee
+        update_mask.append("assignee")
+    if name:
+        body["displayName"] = name
+        update_mask.append("displayName")
+
+    cid = case_id.replace("cases/", "")
+    return _request("PATCH", f"cases/{cid}",
+                    payload=body,
+                    params={"updateMask": ",".join(update_mask)})
+
+
+@mcp.tool()
+def secops_add_case_comment(case_id: str, comment: str) -> dict:
+    """
+    Add a comment (analyst note) to a security case.
+
+    Args:
+        case_id: Case ID.
+        comment: Text of the comment to add.
+
+    Returns:
+        Created comment object with id and createTime.
+    """
+    cid = case_id.replace("cases/", "")
+    return _request("POST", f"cases/{cid}/caseComments", {"comment": comment})
+
+
+@mcp.tool()
+def secops_list_case_alerts(case_id: str, page_size: int = 100) -> dict:
+    """
+    List all alerts associated with a specific case.
+
+    Args:
+        case_id:   Case ID.
+        page_size: Max alerts to return (default 100).
+
+    Returns:
+        Dict with 'caseAlerts' list.
+    """
+    cid = case_id.replace("cases/", "")
+    return _request("GET", f"cases/{cid}/caseAlerts",
+                    params={"pageSize": page_size})
+
+
+@mcp.tool()
+def secops_generate_case_report(case_id: str) -> dict:
+    """
+    Generate a full incident report for a case (PDF-ready summary).
+
+    Args:
+        case_id: Case ID.
+
+    Returns:
+        Report content with timeline, entities, actions taken, and findings.
+    """
+    cid = case_id.replace("cases/", "")
+    return _request("POST", f"cases/{cid}:generateReport", {})
+
+
+@mcp.tool()
+def secops_merge_cases(case_ids: list, target_case_id: str = "") -> dict:
+    """
+    Merge multiple cases into one (de-duplicate incidents).
+
+    Args:
+        case_ids:       List of case IDs to merge (e.g. ["1234", "5678"]).
+        target_case_id: The case to merge everything INTO. If empty, uses first ID.
+
+    Returns:
+        Merged case object.
+    """
+    target = target_case_id or case_ids[0]
+    source_ids = [cid for cid in case_ids if cid != target]
+    target_clean = target.replace("cases/", "")
+    return _request("POST", f"cases/{target_clean}:merge", {
+        "caseIds": [f"cases/{cid.replace('cases/', '')}" for cid in source_ids]
+    })
+
+
+@mcp.tool()
+def secops_bulk_close_cases(
+    case_ids: list,
+    reason: str = "Resolved",
+    comment: str = "",
+) -> dict:
+    """
+    Close multiple cases at once.
+
+    Args:
+        case_ids: List of case IDs to close.
+        reason:   Closure reason: "Resolved", "False Positive", "Duplicate", etc.
+        comment:  Optional closing comment added to all cases.
+
+    Returns:
+        Dict with 'closedCases' count and any errors.
+    """
+    return _request("POST", "cases:executeBulkClose", {
+        "caseIds": [f"cases/{cid.replace('cases/', '')}" for cid in case_ids],
+        "reason": reason,
+        "comment": comment,
+    })
+
+
+# ── Connection Test ───────────────────────────────────────────────────────────
 
 @mcp.tool()
 def secops_connection_test() -> dict:

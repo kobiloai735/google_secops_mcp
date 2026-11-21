@@ -4,6 +4,8 @@
 service_account.json
 *credentials*.json
 *token*.json
+# Any JSON in the project root (service-account keys are often named <project>-<id>.json)
+/*.json
 
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/

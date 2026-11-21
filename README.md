@@ -3,6 +3,8 @@
 > **Web dashboard + MCP server** לניהול וחקירת Google SecOps (Chronicle) דרך Claude Code.
 > A full-featured web dashboard and MCP server for Google SecOps (Chronicle) via Claude Code.
 
+> 🚀 **משתמש חדש? התחילו ב-[INSTALL.md](INSTALL.md)**: מדריך התקנה צעד-אחר-צעד, כולל מאיפה מביאים את הערכים ואת המפתח.
+
 ---
 
 ## 📋 תוכן עניינים | Table of Contents
@@ -24,12 +26,12 @@
 
 **עברית:**
 מערכת זו מאפשרת לצוות ה-SOC לתקשר עם Google SecOps (Chronicle) דרך שני ערוצים:
-1. **MCP Server** (`server.py`) — מאפשר ל-Claude Code לקרוא לכל 10 פונקציות ה-API של Chronicle ישירות
+1. **MCP Server** (`server.py`) — מאפשר ל-Claude Code לקרוא ל-24 פונקציות ה-API של Chronicle ישירות
 2. **Web Dashboard** (`dashboard.py`) — ממשק ויזואלי מתקדם על פורט 5001 עם ניתוח, גרפים, ותיעוד
 
 **English:**
 This system enables SOC teams to interact with Google SecOps (Chronicle) through two channels:
-1. **MCP Server** (`server.py`) — Exposes all 10 Chronicle API functions as Claude Code tools
+1. **MCP Server** (`server.py`) — Exposes 24 Chronicle API functions as Claude Code tools
 2. **Web Dashboard** (`dashboard.py`) — Advanced visual interface on port 5001 with analysis, charts, and documentation
 
 ---
@@ -68,22 +70,20 @@ This system enables SOC teams to interact with Google SecOps (Chronicle) through
 
 | קובץ | תיאור | Description |
 |------|--------|-------------|
-| `server.py` | MCP server עם 10 כלים לChronicle API | MCP server with 10 Chronicle API tools |
+| `server.py` | MCP server עם 24 כלים לChronicle API | MCP server with 24 Chronicle API tools |
 | `dashboard.py` | Flask web dashboard על פורט 5001 | Flask web dashboard on port 5001 |
 | `requirements.txt` | תלויות Python | Python dependencies |
 | `.env.example` | תבנית למשתני סביבה (העתק ל-.env) | Environment variables template (copy to .env) |
-| `auth_server.py` | עזר לאימות OAuth2 | OAuth2 authentication helper |
-| `oauth_login.py` | כלי להשגת OAuth tokens | OAuth token acquisition tool |
-| `token_test.py` | בדיקת tokens | Token testing utility |
-| `get_token.js` | JavaScript לקבלת token | JavaScript token helper |
-| `.claude/launch.json` | הגדרות Claude Preview server | Claude Preview server configuration |
+| `INSTALL.md` | מדריך התקנה למשתמשים חדשים | Step-by-step install guide (Hebrew) |
+| `oauth_login.py` | התחברות ל-Google בלי gcloud | Google login without gcloud (writes ADC) |
+| `dev_tools/` | כלי דיבאג ישנים — לא נדרשים להתקנה | Legacy debug helpers — not needed to install |
 
 ---
 
 ## ⚙️ דרישות | Prerequisites
 
 ### Software
-- **Python 3.9+** — [python.org](https://python.org)
+- **Python 3.10+** — [python.org](https://python.org)
 - **Google Cloud SDK (gcloud)** — [cloud.google.com/sdk](https://cloud.google.com/sdk)
 - **Git** — [git-scm.com](https://git-scm.com)
 - **Claude Code** (אופציונלי לשימוש כ-MCP) — [claude.ai/code](https://claude.ai/code)
@@ -99,7 +99,7 @@ This system enables SOC teams to interact with Google SecOps (Chronicle) through
 
 ### שלב 1 — שיבוט המאגר | Clone Repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/google_secops_mcp.git
+git clone https://github.com/kobiloai735/google_secops_mcp.git
 cd google_secops_mcp
 ```
 
@@ -187,22 +187,12 @@ python server.py
 ```
 הפעלה: `preview_start("secops-dashboard")`
 
-### הוספת ל-Claude Code MCP (`~/.claude/claude_desktop_config.json`):
-```json
-{
-  "mcpServers": {
-    "google-secops": {
-      "command": "python",
-      "args": ["C:\\path\\to\\server.py"],
-      "env": {
-        "SECOPS_PROJECT_ID": "your-project",
-        "SECOPS_INSTANCE_ID": "your-instance-guid",
-        "SECOPS_REGION": "us"
-      }
-    }
-  }
-}
+### הוספה ל-Claude Code כשרת MCP | Register with Claude Code
+```bash
+claude mcp add google_secops --scope user -- python "C:\path\to\google_secops_mcp\server.py"
 ```
+השרת קורא את `.env` מהתיקייה שלו. פרטים נוספים ב-[INSTALL.md](INSTALL.md), שלב 7.
+The server reads `.env` from its own folder, so no env values are needed in the command.
 
 ---
 
@@ -241,7 +231,7 @@ python server.py
 ### Explorer
 | כפתור | תיאור |
 |--------|--------|
-| 🤖 **MCP Explorer** | חקרן יכולות: 10 כלי MCP, שדות UDM, יכולות AI |
+| 🤖 **MCP Explorer** | חקרן יכולות: כלי MCP, שדות UDM, יכולות AI |
 
 ---
 
@@ -253,7 +243,7 @@ python server.py
 | `secops_list_rules` | GET | `rules` | `page_size` |
 | `secops_get_rule` | GET | `rules/{id}` | `rule_id`* |
 | `secops_create_rule` | POST | `rules` | `rule_text`* |
-| `secops_validate_rule` | POST | `rules:verifyRule` | `rule_text`* |
+| `secops_validate_rule` | POST | `:verifyRuleText` | `rule_text`* |
 | `secops_toggle_rule` | PATCH | `rules/{id}/deployment` | `rule_id`, `enabled`, `alerting` |
 | `secops_list_detections` | GET | `rules/{id}/detections` | `rule_id`*, `hours_back` |
 | `secops_list_alerts` | GET | `legacy:legacySearchDetections` | `hours_back`, `state_filter` |

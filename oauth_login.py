@@ -19,11 +19,14 @@ import pathlib
 AUTH_URL   = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL  = "https://oauth2.googleapis.com/token"
 
-# Chronicle scope
-SCOPE = "https://www.googleapis.com/auth/chronicle-backstory"
+# Chronicle scope — cloud-platform is the correct scope for the Chronicle v1alpha API
+SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
-# ADC credentials file path (same location gcloud uses)
-ADC_PATH = pathlib.Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+# ADC credentials file path (same location gcloud uses: %APPDATA% on Windows)
+if os.name == "nt":
+    ADC_PATH = pathlib.Path(os.environ["APPDATA"]) / "gcloud" / "application_default_credentials.json"
+else:
+    ADC_PATH = pathlib.Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
 
 # ── Use the gcloud installed-app client ID (public, built into gcloud) ────────
 # These are the same client_id/secret that gcloud uses for ADC.

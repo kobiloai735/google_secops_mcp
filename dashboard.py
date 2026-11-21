@@ -7,16 +7,15 @@ Runs on http://127.0.0.1:5001
 import os, sys, json, time, warnings
 from collections import deque
 from datetime import datetime
+from html import escape as _html_escape
 
 warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(__file__))
 
 # Load env vars before importing server
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
-os.environ.setdefault("SECOPS_PROJECT_ID",  "secops-demo-env")
-os.environ.setdefault("SECOPS_INSTANCE_ID", "a13f6726-efed-452e-9008-8fe0d3cb0f75")
 os.environ.setdefault("SECOPS_REGION",      "us")
 
 from flask import Flask, jsonify, request, make_response
@@ -27,22 +26,47 @@ from server import (
     secops_create_rule, secops_validate_rule, secops_toggle_rule,
     secops_list_detections, secops_list_alerts, secops_list_reference_lists,
     secops_udm_search,
+    # Phase A — Retrohunts + Reference Lists CRUD
+    secops_create_retrohunt, secops_get_retrohunt, secops_list_retrohunts,
+    secops_create_reference_list, secops_update_reference_list, secops_delete_reference_list,
+    # Phase B — Cases / SOAR
+    secops_list_cases, secops_get_case, secops_update_case, secops_add_case_comment,
+    secops_list_case_alerts, secops_generate_case_report, secops_merge_cases,
+    secops_bulk_close_cases,
 )
 
 app = Flask(__name__)
 _history = deque(maxlen=100)
 
 TOOL_DISPATCH = {
-    "connection_test":      (secops_connection_test,      []),
-    "list_rules":           (secops_list_rules,           ["page_size"]),
-    "get_rule":             (secops_get_rule,             ["rule_id"]),
-    "create_rule":          (secops_create_rule,          ["rule_text"]),
-    "validate_rule":        (secops_validate_rule,        ["rule_text"]),
-    "toggle_rule":          (secops_toggle_rule,          ["rule_id", "enabled", "alerting"]),
-    "list_detections":      (secops_list_detections,      ["rule_id", "hours_back"]),
-    "list_alerts":          (secops_list_alerts,          ["hours_back", "state_filter"]),
-    "list_reference_lists": (secops_list_reference_lists, ["page_size"]),
-    "udm_search":           (secops_udm_search,           ["query", "hours_back"]),
+    # Original 10
+    "connection_test":        (secops_connection_test,        []),
+    "list_rules":             (secops_list_rules,             ["page_size"]),
+    "get_rule":               (secops_get_rule,               ["rule_id"]),
+    "create_rule":            (secops_create_rule,            ["rule_text"]),
+    "validate_rule":          (secops_validate_rule,          ["rule_text"]),
+    "toggle_rule":            (secops_toggle_rule,            ["rule_id", "enabled", "alerting"]),
+    "list_detections":        (secops_list_detections,        ["rule_id", "hours_back"]),
+    "list_alerts":            (secops_list_alerts,            ["hours_back", "state_filter"]),
+    "list_reference_lists":   (secops_list_reference_lists,   ["page_size"]),
+    "udm_search":             (secops_udm_search,             ["query", "hours_back"]),
+    # Phase A — Retrohunts
+    "create_retrohunt":       (secops_create_retrohunt,       ["rule_id", "hours_back", "start_time", "end_time"]),
+    "get_retrohunt":          (secops_get_retrohunt,          ["rule_id", "retrohunt_id"]),
+    "list_retrohunts":        (secops_list_retrohunts,        ["rule_id", "page_size"]),
+    # Phase A — Reference Lists CRUD
+    "create_reference_list":  (secops_create_reference_list,  ["name", "lines", "description", "syntax_type"]),
+    "update_reference_list":  (secops_update_reference_list,  ["list_id", "lines", "description"]),
+    "delete_reference_list":  (secops_delete_reference_list,  ["list_id"]),
+    # Phase B — Cases
+    "list_cases":             (secops_list_cases,             ["page_size", "state_filter", "priority_filter"]),
+    "get_case":               (secops_get_case,               ["case_id"]),
+    "update_case":            (secops_update_case,            ["case_id", "priority", "stage", "assignee", "name"]),
+    "add_case_comment":       (secops_add_case_comment,       ["case_id", "comment"]),
+    "list_case_alerts":       (secops_list_case_alerts,       ["case_id", "page_size"]),
+    "generate_case_report":   (secops_generate_case_report,   ["case_id"]),
+    "merge_cases":            (secops_merge_cases,            ["case_ids", "target_case_id"]),
+    "bulk_close_cases":       (secops_bulk_close_cases,       ["case_ids", "reason", "comment"]),
 }
 
 def coerce(val, name):
@@ -54,11 +78,17 @@ def coerce(val, name):
     if name in ("enabled", "alerting"):
         if isinstance(val, bool): return val
         return str(val).lower() in ("true", "1", "yes")
+    if name in ("lines", "case_ids"):
+        if isinstance(val, list): return val
+        if isinstance(val, str):
+            try: return json.loads(val)
+            except: return [v.strip() for v in val.splitlines() if v.strip()]
     return val
 
 @app.route("/")
 def index():
-    return make_response(HTML, 200, {"Content-Type": "text/html; charset=utf-8"})
+    page = HTML.replace("__PROJECT_ID__", _html_escape(_srv.PROJECT_ID or "not configured"))
+    return make_response(page, 200, {"Content-Type": "text/html; charset=utf-8"})
 
 @app.route("/api/status")
 def api_status():
@@ -115,8 +145,7 @@ _activity_log = deque(maxlen=200)
 _orig_request = _srv._request
 
 def _traced_request(method, endpoint, payload=None, params=None):
-    from server import BASE_URL, INSTANCE_PATH
-    url = f"{BASE_URL}/v1alpha/{INSTANCE_PATH}/{endpoint}"
+    url = _srv._api_url(endpoint)
     t0 = time.time()
     try:
         result = _orig_request(method, endpoint, payload, params)
@@ -174,11 +203,11 @@ def analyze_explorer():
          "inputs":["rule_text: str — full YARA-L 2.0 source code"],
          "outputs":["name (assigned rule ID)","displayName","text","createTime","revisionId"],
          "tags":["create","rule","new","write","yara"]},
-        {"name":"secops_validate_rule","method":"POST","endpoint":"rules:verifyRule","icon":"✅",
+        {"name":"secops_validate_rule","method":"POST","endpoint":":verifyRuleText","icon":"✅",
          "desc_en":"Validate (compile) a YARA-L rule without saving. Zero side-effects — safe for testing.",
          "desc_he":"בדיקת תחביר YARA-L ללא שמירה. בטוח לשימוש — אין השפעה על המערכת.",
          "inputs":["rule_text: str — YARA-L source to validate"],
-         "outputs":["success: bool","errors[].errorMessage","errors[].position"],
+         "outputs":["success: true (absent on compile error)","compilationDiagnostics[].message","compilationDiagnostics[].position","compilationDiagnostics[].severity"],
          "tags":["validate","verify","syntax","compile","test","rule"]},
         {"name":"secops_toggle_rule","method":"PATCH","endpoint":"rules/{id}/deployment","icon":"⚡",
          "desc_en":"Enable or disable a detection rule and its alerting. Disabling enabled=False also disables alerting.",
@@ -790,6 +819,277 @@ def analyze_intelligence():
         return jsonify({"ok": False, "error": str(e)})
 
 
+# ── AI Bot ───────────────────────────────────────────────────────────────────
+
+import re, concurrent.futures as _cf_bot
+
+def _bot_detect_intent(query: str) -> str:
+    q = query.lower()
+    if any(k in q for k in ["retrohunt","ציד היסטורי","historical","replay","הרץ על עבר"]):
+        return "retrohunt"
+    if any(k in q for k in ["case","תיק","incident","soar","חקירה","חקור","investigate"]):
+        return "cases"
+    if any(k in q for k in ["block","חסום","ioc list","reference list","blocklist","allowlist","רשימה חדשה","הוסף ל"]):
+        return "ioc_manage"
+    if any(k in q for k in ["rule","חוק","yara","create rule","צור חוק","validate"]):
+        return "rules"
+    if any(k in q for k in ["alert","התראה","התראות","severity","critical","high alert"]):
+        return "alerts"
+    if any(k in q for k in ["report","דוח","סכם","summary","overview","מה קרה","status","daily"]):
+        return "report"
+    if any(k in q for k in ["search","חפש","find","מצא","udm","login","brute","powershell","ip ","user ","משתמש","network"]):
+        return "search"
+    return "report"
+
+def _bot_build_udm_query(query: str) -> str:
+    q = query.lower()
+    parts = []
+    if any(k in q for k in ["failed login","כניסה כושלת","brute force","wrong password","login block"]):
+        parts = ['metadata.event_type = "USER_LOGIN"', 'security_result.action = "BLOCK"']
+    elif any(k in q for k in ["powershell","פאוורשל"]):
+        parts = ['metadata.event_type = "PROCESS_LAUNCH"', 'target.process.command_line = /powershell/i']
+    elif any(k in q for k in ["dns","domain query"]):
+        parts = ['metadata.event_type = "NETWORK_DNS"', 'network.dns.question.name != ""']
+    elif any(k in q for k in ["network","connection","חיבור רשת"]):
+        parts = ['metadata.event_type = "NETWORK_CONNECTION"']
+    elif any(k in q for k in ["file","קובץ","write","creation"]):
+        parts = ['metadata.event_type = "FILE_MODIFICATION"']
+    else:
+        # extract IP / user from query
+        ip = re.search(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', query)
+        user = re.search(r'user[:\s]+(\w+)|משתמש[:\s]+(\w+)', query, re.I)
+        if ip:
+            parts = [f'principal.ip = "{ip.group(1)}"']
+        elif user:
+            uid = user.group(1) or user.group(2)
+            parts = [f'principal.user.userid = "{uid}"']
+        else:
+            parts = ['security_result.severity = "HIGH"']
+    return " AND ".join(parts)
+
+@app.route("/api/bot", methods=["POST"])
+def api_bot():
+    body = request.get_json(silent=True) or {}
+    query = body.get("query", "").strip()
+    if not query:
+        return jsonify({"ok": False, "error": "query is required"})
+
+    intent = _bot_detect_intent(query)
+    steps = []
+    result_html = ""
+
+    try:
+        if intent == "search":
+            udm_q = _bot_build_udm_query(query)
+            data = secops_udm_search(query=udm_q, hours_back=24)
+            events = data.get("events", [])
+            steps.append({"tool": "secops_udm_search", "query": udm_q})
+            result_html = _bot_fmt_events(events, udm_q)
+
+        elif intent == "alerts":
+            hours = 24
+            m = re.search(r'(\d+)\s*(hour|שעה|שעות|h\b)', query, re.I)
+            if m: hours = int(m.group(1))
+            data = secops_list_alerts(hours_back=hours)
+            alerts = data.get("alerts", data.get("detections", []))
+            steps.append({"tool": "secops_list_alerts", "hours_back": hours})
+            result_html = _bot_fmt_alerts(alerts, hours)
+
+        elif intent == "rules":
+            data = secops_list_rules(page_size=100)
+            rules = data.get("rules", [])
+            steps.append({"tool": "secops_list_rules"})
+            result_html = _bot_fmt_rules(rules)
+
+        elif intent == "cases":
+            data = secops_list_cases(page_size=50, state_filter="OPEN")
+            cases = data.get("cases", [])
+            steps.append({"tool": "secops_list_cases", "state": "OPEN"})
+            result_html = _bot_fmt_cases(cases)
+
+        elif intent == "retrohunt":
+            data = secops_list_rules(page_size=100)
+            rules = data.get("rules", [])
+            steps.append({"tool": "secops_list_rules"})
+            result_html = _bot_fmt_retrohunt_prompt(rules, query)
+
+        elif intent == "ioc_manage":
+            data = secops_list_reference_lists(page_size=50)
+            lists_ = data.get("referenceLists", [])
+            steps.append({"tool": "secops_list_reference_lists"})
+            result_html = _bot_fmt_ref_lists(lists_, query)
+
+        else:  # report — run all in parallel
+            with _cf_bot.ThreadPoolExecutor(max_workers=3) as ex:
+                f_rules  = ex.submit(secops_list_rules, 100)
+                f_alerts = ex.submit(secops_list_alerts, 24)
+                f_cases  = ex.submit(secops_list_cases, 20, "OPEN")
+            rules   = f_rules.result().get("rules", [])
+            alerts  = f_alerts.result().get("alerts", f_alerts.result().get("detections", []))
+            cases   = f_cases.result().get("cases", [])
+            steps = [{"tool":"secops_list_rules"},{"tool":"secops_list_alerts"},{"tool":"secops_list_cases"}]
+            result_html = _bot_fmt_report(rules, alerts, cases)
+
+        return jsonify({"ok": True, "intent": intent, "steps": steps, "html": result_html})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "intent": intent})
+
+
+def _sev_badge(sev):
+    colors = {"CRITICAL":"#f85149","HIGH":"#e3b341","MEDIUM":"#58a6ff","LOW":"#39d353"}
+    c = colors.get(str(sev).upper(), "#8b949e")
+    return f'<span style="background:{c}20;color:{c};border:1px solid {c}40;border-radius:4px;padding:1px 6px;font-size:11px;font-weight:600">{sev}</span>'
+
+def _bot_fmt_events(events, query):
+    if not events:
+        return f'<div class="bot-empty">🔍 No events found for: <code>{query}</code></div>'
+    rows = ""
+    for e in events[:20]:
+        meta = e.get("metadata", {})
+        princ = e.get("principal", {})
+        tgt = e.get("target", {})
+        sr = e.get("securityResult", [{}])
+        sev = sr[0].get("severity","") if isinstance(sr,list) and sr else ""
+        ts = meta.get("eventTimestamp","")[:19].replace("T"," ")
+        etype = meta.get("eventType","")
+        ip = princ.get("ip",[""])[0] if isinstance(princ.get("ip"),list) else princ.get("ip","")
+        user = princ.get("user",{}).get("userid","")
+        action = sr[0].get("action","") if isinstance(sr,list) and sr else ""
+        rows += f'<tr><td>{ts}</td><td><code>{etype}</code></td><td>{ip}</td><td>{user}</td><td>{_sev_badge(sev) if sev else ""}</td><td>{action}</td></tr>'
+    return f'''<div class="bot-section">
+<div class="bot-header">🔍 UDM Search Results — <code>{query}</code></div>
+<div class="bot-stat">Found <strong>{len(events)}</strong> events (showing top 20)</div>
+<table class="bot-table"><thead><tr><th>Time</th><th>Type</th><th>Source IP</th><th>User</th><th>Severity</th><th>Action</th></tr></thead>
+<tbody>{rows}</tbody></table></div>'''
+
+def _bot_fmt_alerts(alerts, hours):
+    if not alerts:
+        return f'<div class="bot-empty">✅ No alerts in the last {hours} hours.</div>'
+    by_sev = {}
+    for a in alerts:
+        s = str(a.get("severity", a.get("riskScore","UNKNOWN"))).upper()
+        by_sev[s] = by_sev.get(s,0) + 1
+    badges = "".join(f'{_sev_badge(s)} <strong>{c}</strong>&nbsp;&nbsp;' for s,c in sorted(by_sev.items(), key=lambda x:-x[1]))
+    rows = ""
+    for a in alerts[:15]:
+        det = a.get("detection",[])
+        rule = det[0].get("ruleName","") if isinstance(det,list) and det else a.get("ruleName","Unknown")
+        sev = str(a.get("severity", a.get("riskScore",""))).upper()
+        state = a.get("feedbackSummary",{}).get("status", a.get("state",""))
+        ts = a.get("detectionTimestamp","")[:19].replace("T"," ")
+        rows += f'<tr><td>{ts}</td><td>{rule}</td><td>{_sev_badge(sev)}</td><td>{state}</td></tr>'
+    return f'''<div class="bot-section">
+<div class="bot-header">🚨 Alert Summary — last {hours}h</div>
+<div class="bot-stat">{len(alerts)} total &nbsp; {badges}</div>
+<table class="bot-table"><thead><tr><th>Time</th><th>Rule</th><th>Severity</th><th>State</th></tr></thead>
+<tbody>{rows}</tbody></table></div>'''
+
+def _bot_fmt_rules(rules):
+    enabled = [r for r in rules if r.get("deploymentState","").upper() == "ENABLED"]
+    live = [r for r in rules if "LIVE" in r.get("allowedRunFrequencies",[])]
+    rows = ""
+    for r in rules[:30]:
+        name = r.get("displayName", r.get("name","").split("/")[-1])
+        state = r.get("deploymentState","")
+        dot = '<span style="color:#39d353">●</span>' if state=="ENABLED" else '<span style="color:#8b949e">●</span>'
+        rtype = r.get("type","")
+        sev = r.get("metaData",{}).get("severity","") if isinstance(r.get("metaData"),dict) else ""
+        rows += f'<tr><td>{dot}</td><td>{name}</td><td>{rtype}</td><td>{_sev_badge(sev) if sev else ""}</td></tr>'
+    return f'''<div class="bot-section">
+<div class="bot-header">📋 Detection Rules Overview</div>
+<div class="bot-stat"><strong>{len(rules)}</strong> total &nbsp; <strong style="color:#39d353">{len(enabled)}</strong> enabled &nbsp; <strong style="color:#58a6ff">{len(live)}</strong> LIVE</div>
+<table class="bot-table"><thead><tr><th></th><th>Name</th><th>Type</th><th>Severity</th></tr></thead>
+<tbody>{rows}</tbody></table></div>'''
+
+def _bot_fmt_cases(cases):
+    if not cases:
+        return '<div class="bot-empty">📁 No open cases found.</div>'
+    rows = ""
+    pri_colors = {"CRITICAL":"#f85149","HIGH":"#e3b341","MEDIUM":"#58a6ff","LOW":"#39d353"}
+    for c in cases[:20]:
+        cid = c.get("displayId", c.get("name","").split("/")[-1])
+        name = c.get("displayName", c.get("name",""))
+        pri = c.get("priority","")
+        stage = c.get("stage","")
+        assignee = c.get("assignee","—")
+        col = pri_colors.get(pri,"#8b949e")
+        rows += f'<tr><td><code>{cid}</code></td><td>{name[:50]}</td><td><span style="color:{col};font-weight:600">{pri}</span></td><td>{stage}</td><td>{assignee}</td></tr>'
+    return f'''<div class="bot-section">
+<div class="bot-header">📁 Open Cases</div>
+<div class="bot-stat"><strong>{len(cases)}</strong> open cases</div>
+<table class="bot-table"><thead><tr><th>ID</th><th>Name</th><th>Priority</th><th>Stage</th><th>Assignee</th></tr></thead>
+<tbody>{rows}</tbody></table></div>'''
+
+def _bot_fmt_ref_lists(lists_, query):
+    rows = ""
+    for l in lists_[:20]:
+        nm = l.get("name","").split("/")[-1]
+        desc = l.get("description","")
+        stype = l.get("syntaxType","")
+        cnt = len(l.get("lines",[]))
+        rows += f'<tr><td><code>{nm}</code></td><td>{desc[:40]}</td><td>{stype}</td><td>{cnt}</td></tr>'
+    return f'''<div class="bot-section">
+<div class="bot-header">📝 Reference Lists (IOC / Blocklists)</div>
+<div class="bot-stat"><strong>{len(lists_)}</strong> lists found</div>
+<table class="bot-table"><thead><tr><th>Name</th><th>Description</th><th>Type</th><th>Entries</th></tr></thead>
+<tbody>{rows}</tbody></table>
+<div class="bot-tip">💡 Use <strong>Create Reference List</strong> or <strong>Update Reference List</strong> from the sidebar to manage entries.</div></div>'''
+
+def _bot_fmt_retrohunt_prompt(rules, query):
+    rows = ""
+    for r in rules[:20]:
+        name = r.get("displayName", r.get("name","").split("/")[-1])
+        rid = r.get("name","").split("/")[-1]
+        rows += f'<tr><td><code>{rid}</code></td><td>{name}</td><td>{r.get("deploymentState","")}</td></tr>'
+    return f'''<div class="bot-section">
+<div class="bot-header">⏮️ Retrohunt — Available Rules</div>
+<div class="bot-stat">Select a rule below, then use <strong>Create Retrohunt</strong> from the sidebar.</div>
+<table class="bot-table"><thead><tr><th>Rule ID</th><th>Name</th><th>State</th></tr></thead>
+<tbody>{rows}</tbody></table>
+<div class="bot-tip">💡 Paste the Rule ID into <strong>Create Retrohunt</strong> with your desired time range.</div></div>'''
+
+def _bot_fmt_report(rules, alerts, cases):
+    from datetime import date
+    today = date.today().strftime("%Y-%m-%d")
+    enabled = sum(1 for r in rules if r.get("deploymentState","").upper()=="ENABLED")
+    live = sum(1 for r in rules if "LIVE" in r.get("allowedRunFrequencies",[]))
+    by_sev = {}
+    for a in alerts:
+        s = str(a.get("severity","UNKNOWN")).upper()
+        by_sev[s] = by_sev.get(s,0)+1
+    crit = by_sev.get("CRITICAL",0)
+    high = by_sev.get("HIGH",0)
+    sev_html = "".join(f'{_sev_badge(s)} <strong>{c}</strong>&nbsp;&nbsp;' for s,c in sorted(by_sev.items()))
+    top_cases = ""
+    for c in cases[:5]:
+        cid = c.get("displayId","")
+        nm = c.get("displayName","")[:40]
+        pri = c.get("priority","")
+        col = {"CRITICAL":"#f85149","HIGH":"#e3b341","MEDIUM":"#58a6ff","LOW":"#39d353"}.get(pri,"#8b949e")
+        top_cases += f'<li><code>{cid}</code> {nm} — <span style="color:{col}">{pri}</span></li>'
+    actions = []
+    if crit > 0: actions.append(f"⚠️ {crit} CRITICAL alerts require immediate investigation")
+    if high > 5: actions.append(f"🔍 {high} HIGH alerts — review for false positives")
+    if len(cases) > 10: actions.append("📁 High open case volume — consider bulk triage")
+    if not actions: actions.append("✅ Security posture looks normal")
+    actions_html = "".join(f'<li>{a}</li>' for a in actions)
+    return f'''<div class="bot-section">
+<div class="bot-header">📊 SOC Daily Report — {today}</div>
+<div class="bot-kpis">
+  <div class="bot-kpi"><div class="bot-kpi-val">{len(rules)}</div><div class="bot-kpi-lbl">Total Rules</div></div>
+  <div class="bot-kpi"><div class="bot-kpi-val" style="color:#39d353">{enabled}</div><div class="bot-kpi-lbl">Enabled</div></div>
+  <div class="bot-kpi"><div class="bot-kpi-val" style="color:#58a6ff">{live}</div><div class="bot-kpi-lbl">LIVE</div></div>
+  <div class="bot-kpi"><div class="bot-kpi-val" style="color:#f85149">{len(alerts)}</div><div class="bot-kpi-lbl">24h Alerts</div></div>
+  <div class="bot-kpi"><div class="bot-kpi-val" style="color:#e3b341">{len(cases)}</div><div class="bot-kpi-lbl">Open Cases</div></div>
+</div>
+<div class="bot-sub">Alert Severity Breakdown</div>
+<div style="margin:6px 0 12px">{sev_html or "No alerts"}</div>
+{'<div class="bot-sub">Open Cases (top 5)</div><ul class="bot-list">' + top_cases + '</ul>' if top_cases else ''}
+<div class="bot-sub">Recommended Actions</div>
+<ul class="bot-list">{actions_html}</ul>
+</div>'''
+
+
 # ── HTML ─────────────────────────────────────────────────────────────────────
 
 HTML = """<!DOCTYPE html>
@@ -846,6 +1146,46 @@ aside{width:220px;background:var(--surface);border-right:1px solid var(--border)
 /* CONTENT */
 .content{flex:1;display:flex;flex-direction:column;overflow:hidden}
 
+/* BOT PANEL */
+.bot-panel{display:flex;flex-direction:column;flex:1;overflow:hidden;background:var(--bg)}
+.bot-messages{flex:1;overflow-y:auto;padding:16px 24px;display:flex;flex-direction:column;gap:12px}
+.bot-input-row{display:flex;gap:8px;padding:12px 24px;background:var(--surface);border-top:1px solid var(--border)}
+.bot-input{flex:1;background:var(--elevated);border:1px solid var(--border);color:var(--text);padding:10px 14px;border-radius:8px;font-size:13px;font-family:var(--ui);outline:none;transition:border .2s}
+.bot-input:focus{border-color:var(--blue)}
+.bot-send{background:var(--blue);color:#000;border:none;border-radius:8px;padding:10px 18px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .2s}
+.bot-send:hover{opacity:.85}
+.bot-send:disabled{opacity:.4;cursor:default}
+.bot-msg{display:flex;gap:10px}
+.bot-msg-user{flex-direction:row-reverse}
+.bot-bubble{max-width:80%;padding:10px 14px;border-radius:10px;font-size:13px;line-height:1.5}
+.bot-bubble-user{background:var(--blue);color:#000;border-radius:10px 10px 2px 10px}
+.bot-bubble-bot{background:var(--elevated);border:1px solid var(--border);color:var(--text);border-radius:10px 10px 10px 2px}
+.bot-avatar{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;margin-top:2px}
+.bot-avatar-user{background:var(--blue);color:#000}
+.bot-avatar-bot{background:var(--elevated);border:1px solid var(--border)}
+.bot-thinking{display:flex;gap:4px;align-items:center;padding:10px 14px}
+.bot-dot{width:6px;height:6px;border-radius:50%;background:var(--muted);animation:botdot 1.2s infinite}
+.bot-dot:nth-child(2){animation-delay:.2s}
+.bot-dot:nth-child(3){animation-delay:.4s}
+@keyframes botdot{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-6px)}}
+/* Bot result HTML */
+.bot-section{padding:4px 0}
+.bot-header{font-size:15px;font-weight:700;color:var(--text);margin-bottom:8px}
+.bot-stat{font-size:13px;color:var(--muted);margin-bottom:10px}
+.bot-sub{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin:10px 0 4px}
+.bot-kpis{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.bot-kpi{background:var(--elevated);border:1px solid var(--border);border-radius:8px;padding:10px 16px;text-align:center;min-width:80px}
+.bot-kpi-val{font-size:22px;font-weight:700;color:var(--text)}
+.bot-kpi-lbl{font-size:11px;color:var(--muted);margin-top:2px}
+.bot-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
+.bot-table th{text-align:left;padding:6px 8px;color:var(--muted);border-bottom:1px solid var(--border);font-weight:600;font-size:11px;text-transform:uppercase}
+.bot-table td{padding:5px 8px;border-bottom:1px solid var(--border)20;color:var(--text)}
+.bot-table tr:hover td{background:var(--elevated)50}
+.bot-empty{padding:24px;text-align:center;color:var(--muted);font-size:13px}
+.bot-tip{margin-top:12px;padding:8px 12px;background:var(--blue)15;border:1px solid var(--blue)30;border-radius:6px;font-size:12px;color:var(--blue)}
+.bot-list{padding-left:18px;font-size:13px;line-height:1.8}
+.bot-steps{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.bot-step-chip{background:var(--elevated);border:1px solid var(--border);border-radius:12px;padding:2px 10px;font-size:11px;color:var(--muted);font-family:var(--mono)}
 /* FORM PANEL */
 .form-panel{padding:20px 24px;background:var(--surface);border-bottom:1px solid var(--border);overflow-y:auto;max-height:45vh;flex-shrink:0}
 .form-title{font-size:16px;font-weight:600;color:var(--text);margin-bottom:4px;display:flex;align-items:center;gap:8px}
@@ -1066,8 +1406,8 @@ select option{background:var(--elevated)}
     </div>
   </div>
   <div class="header-right">
-    <span>secops-lab</span> &nbsp;|&nbsp;
-    <span id="project-info">secops-demo-env</span>
+    <span>Google SecOps</span> &nbsp;|&nbsp;
+    <span id="project-info">__PROJECT_ID__</span>
   </div>
 </header>
 
@@ -1111,6 +1451,57 @@ select option{background:var(--elevated)}
       <span class="icon">📑</span> Reference Lists
     </button>
 
+    <div class="sidebar-section">⏮️ Retrohunts</div>
+    <button class="tool-btn" onclick="selectTool('create_retrohunt', this)">
+      <span class="icon">🔁</span> Create Retrohunt
+    </button>
+    <button class="tool-btn" onclick="selectTool('list_retrohunts', this)">
+      <span class="icon">📋</span> List Retrohunts
+    </button>
+    <button class="tool-btn" onclick="selectTool('get_retrohunt', this)">
+      <span class="icon">🔍</span> Get Retrohunt
+    </button>
+
+    <div class="sidebar-section">📁 Cases (SOAR)</div>
+    <button class="tool-btn" onclick="selectTool('list_cases', this)">
+      <span class="icon">📂</span> List Cases
+    </button>
+    <button class="tool-btn" onclick="selectTool('get_case', this)">
+      <span class="icon">🔍</span> Get Case
+    </button>
+    <button class="tool-btn" onclick="selectTool('update_case', this)">
+      <span class="icon">✏️</span> Update Case
+    </button>
+    <button class="tool-btn" onclick="selectTool('add_case_comment', this)">
+      <span class="icon">💬</span> Add Comment
+    </button>
+    <button class="tool-btn" onclick="selectTool('list_case_alerts', this)">
+      <span class="icon">🚨</span> Case Alerts
+    </button>
+    <button class="tool-btn" onclick="selectTool('generate_case_report', this)">
+      <span class="icon">📄</span> Generate Report
+    </button>
+    <button class="tool-btn" onclick="selectTool('merge_cases', this)">
+      <span class="icon">🔀</span> Merge Cases
+    </button>
+    <button class="tool-btn" onclick="selectTool('bulk_close_cases', this)">
+      <span class="icon">✅</span> Bulk Close
+    </button>
+
+    <div class="sidebar-section">📝 IOC Management</div>
+    <button class="tool-btn" onclick="selectTool('list_reference_lists', this)">
+      <span class="icon">📑</span> List All
+    </button>
+    <button class="tool-btn" onclick="selectTool('create_reference_list', this)">
+      <span class="icon">➕</span> Create List
+    </button>
+    <button class="tool-btn" onclick="selectTool('update_reference_list', this)">
+      <span class="icon">✏️</span> Update List
+    </button>
+    <button class="tool-btn" onclick="selectTool('delete_reference_list', this)">
+      <span class="icon">🗑️</span> Delete List
+    </button>
+
     <div class="sidebar-section">🧠 Analysis</div>
     <button class="tool-btn" onclick="openAnalysis('rules', this)">
       <span class="icon">📊</span> Analyze All Rules
@@ -1125,28 +1516,35 @@ select option{background:var(--elevated)}
       <span class="icon">🔬</span> Intelligence Report
     </button>
 
+    <div class="sidebar-section">🤖 AI Bot</div>
+    <button class="tool-btn" onclick="openBot(this)">
+      <span class="icon">🧠</span> SOC Assistant
+    </button>
+
     <div class="sidebar-section">🔎 Explorer</div>
     <button class="tool-btn" onclick="openAnalysis('explorer', this)">
-      <span class="icon">🤖</span> MCP Explorer
+      <span class="icon">🔎</span> MCP Explorer
     </button>
   </aside>
 
-  <div class="content">
-    <div class="form-panel" id="form-panel">
-      <div class="empty-state">
-        <div class="big-icon">🛡️</div>
-        <div>Select a tool from the sidebar to get started</div>
+  <div class="content" id="main-content">
+    <!-- Tool mode -->
+    <div id="tool-mode" style="display:flex;flex-direction:column;flex:1;overflow:hidden">
+      <div class="form-panel" id="form-panel">
+        <div class="empty-state">
+          <div class="big-icon">🛡️</div>
+          <div>Select a tool from the sidebar to get started</div>
+        </div>
       </div>
-    </div>
-    <div class="result-tabs">
-      <button class="tab-btn active" id="tab-results" onclick="switchTab('results', this)">📊 Results</button>
-      <button class="tab-btn" id="tab-activity" onclick="switchTab('activity', this)">📡 Activity Log</button>
-    </div>
-    <div class="result-panel" id="panel-results">
-      <div id="result-wrap">
-        <div class="empty-state" style="padding:60px">
-          <div class="big-icon">📊</div>
-          <div>Results will appear here</div>
+      <div class="result-tabs">
+        <button class="tab-btn active" id="tab-results" onclick="switchTab('results', this)">📊 Results</button>
+        <button class="tab-btn" id="tab-activity" onclick="switchTab('activity', this)">📡 Activity Log</button>
+      </div>
+      <div class="result-panel" id="panel-results">
+        <div id="result-wrap">
+          <div class="empty-state" style="padding:60px">
+            <div class="big-icon">📊</div>
+            <div>Results will appear here</div>
         </div>
       </div>
     </div>
@@ -1157,6 +1555,36 @@ select option{background:var(--elevated)}
           <div>No API calls yet — run a tool to see the trace</div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- AI Bot mode -->
+  <div id="bot-mode" style="display:none;flex-direction:column;flex:1;overflow:hidden">
+    <div style="background:var(--surface);border-bottom:1px solid var(--border);padding:12px 24px;display:flex;align-items:center;gap:10px">
+      <span style="font-size:18px">🧠</span>
+      <div>
+        <div style="font-weight:600;font-size:14px">SOC AI Assistant</div>
+        <div style="font-size:11px;color:var(--muted)">Ask me anything about your SecOps environment</div>
+      </div>
+      <button onclick="closeBot()" style="margin-left:auto;background:none;border:1px solid var(--border);color:var(--muted);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px">← Back to Tools</button>
+    </div>
+    <div class="bot-messages" id="bot-messages">
+      <div class="bot-msg">
+        <div class="bot-avatar bot-avatar-bot">🧠</div>
+        <div class="bot-bubble bot-bubble-bot">
+          <strong>SOC Assistant</strong> — powered by Google SecOps API<br><br>
+          Ask me in Hebrew or English:<br>
+          <span style="color:var(--muted)">• "תן לי דוח על מה שקרה היום"</span><br>
+          <span style="color:var(--muted)">• "חפש כניסות כושלות מה-24 שעות האחרונות"</span><br>
+          <span style="color:var(--muted)">• "תראה לי תיקים פתוחים בעדיפות גבוהה"</span><br>
+          <span style="color:var(--muted)">• "SOC daily report"</span><br>
+          <span style="color:var(--muted)">• "show me all detection rules"</span>
+        </div>
+      </div>
+    </div>
+    <div class="bot-input-row">
+      <input class="bot-input" id="bot-input" type="text" placeholder="שאל אותי על SecOps... / Ask me about SecOps..." onkeydown="if(event.key==='Enter')sendBotMsg()">
+      <button class="bot-send" id="bot-send-btn" onclick="sendBotMsg()">Send ▶</button>
     </div>
   </div>
 </div>
@@ -1239,6 +1667,128 @@ window.TOOLS = {
     title: "Reference Lists", icon: "📑",
     desc: "List all reference lists (allowlists / blocklists) in the instance.",
     fields: [{name:"page_size",type:"number",label:"Max lists",default:50}]
+  },
+  // ── Phase A — Retrohunts ──────────────────────────────────────────────────
+  create_retrohunt: {
+    title: "Create Retrohunt", icon: "🔁",
+    desc: "Run an existing YARA-L rule against historical data to find past threats.",
+    fields: [
+      {name:"rule_id",type:"text",label:"Rule ID",placeholder:"ru_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",required:true},
+      {name:"hours_back",type:"number",label:"Lookback (hours)",default:168,placeholder:"168 = 7 days"},
+      {name:"start_time",type:"text",label:"Start Time (optional)",placeholder:"2024-01-01T00:00:00Z"},
+      {name:"end_time",type:"text",label:"End Time (optional)",placeholder:"2024-01-08T00:00:00Z"}
+    ]
+  },
+  list_retrohunts: {
+    title: "List Retrohunts", icon: "📋",
+    desc: "List all retrohunts for a given rule.",
+    fields: [
+      {name:"rule_id",type:"text",label:"Rule ID",placeholder:"ru_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",required:true},
+      {name:"page_size",type:"number",label:"Max results",default:50}
+    ]
+  },
+  get_retrohunt: {
+    title: "Get Retrohunt", icon: "🔍",
+    desc: "Check the status and results of a retrohunt.",
+    fields: [
+      {name:"rule_id",type:"text",label:"Rule ID",required:true,placeholder:"ru_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"},
+      {name:"retrohunt_id",type:"text",label:"Retrohunt ID",required:true,placeholder:"oh_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"}
+    ]
+  },
+  // ── Phase A — Reference Lists CRUD ───────────────────────────────────────
+  create_reference_list: {
+    title: "Create Reference List", icon: "➕",
+    desc: "Create a new IOC blocklist / allowlist.",
+    fields: [
+      {name:"name",type:"text",label:"List Name",required:true,placeholder:"malicious_ips"},
+      {name:"description",type:"text",label:"Description",placeholder:"Known bad IPs from threat intel"},
+      {name:"syntax_type",type:"select",label:"Type",options:["PLAIN_TEXT_STRING","CIDR","REGEX"]},
+      {name:"lines",type:"textarea",label:"Entries (one per line)",rows:8,required:true,placeholder:"1.2.3.4\\n5.6.7.8\\n10.0.0.0/8"}
+    ]
+  },
+  update_reference_list: {
+    title: "Update Reference List", icon: "✏️",
+    desc: "Replace all entries in an existing reference list.",
+    fields: [
+      {name:"list_id",type:"text",label:"List ID / Name",required:true,placeholder:"malicious_ips"},
+      {name:"description",type:"text",label:"New Description (optional)"},
+      {name:"lines",type:"textarea",label:"New Entries (one per line, replaces all)",rows:8,required:true,placeholder:"1.2.3.4\\n9.9.9.9"}
+    ]
+  },
+  delete_reference_list: {
+    title: "Delete Reference List", icon: "🗑️",
+    desc: "Permanently delete a reference list. This action cannot be undone.",
+    fields: [
+      {name:"list_id",type:"text",label:"List ID / Name",required:true,placeholder:"malicious_ips"}
+    ]
+  },
+  // ── Phase B — Cases ───────────────────────────────────────────────────────
+  list_cases: {
+    title: "List Cases", icon: "📂",
+    desc: "List security cases (SOAR incidents) with optional filters.",
+    fields: [
+      {name:"page_size",type:"number",label:"Max cases",default:50},
+      {name:"state_filter",type:"select",label:"State",options:["","OPEN","CLOSED"]},
+      {name:"priority_filter",type:"select",label:"Priority",options:["","LOW","MEDIUM","HIGH","CRITICAL"]}
+    ]
+  },
+  get_case: {
+    title: "Get Case", icon: "🔍",
+    desc: "Retrieve full details of a specific security case.",
+    fields: [
+      {name:"case_id",type:"text",label:"Case ID",required:true,placeholder:"1234"}
+    ]
+  },
+  update_case: {
+    title: "Update Case", icon: "✏️",
+    desc: "Update priority, stage, assignee, or name of a case.",
+    fields: [
+      {name:"case_id",type:"text",label:"Case ID",required:true,placeholder:"1234"},
+      {name:"priority",type:"select",label:"Priority",options:["","LOW","MEDIUM","HIGH","CRITICAL"]},
+      {name:"stage",type:"text",label:"Stage",placeholder:"Investigation / Containment / Eradication"},
+      {name:"assignee",type:"text",label:"Assignee Email",placeholder:"analyst@company.com"},
+      {name:"name",type:"text",label:"Display Name"}
+    ]
+  },
+  add_case_comment: {
+    title: "Add Case Comment", icon: "💬",
+    desc: "Add an analyst note / comment to a security case.",
+    fields: [
+      {name:"case_id",type:"text",label:"Case ID",required:true,placeholder:"1234"},
+      {name:"comment",type:"textarea",label:"Comment",rows:4,required:true,placeholder:"Investigated source IP — confirmed false positive from internal scanner"}
+    ]
+  },
+  list_case_alerts: {
+    title: "Case Alerts", icon: "🚨",
+    desc: "List all alerts associated with a specific case.",
+    fields: [
+      {name:"case_id",type:"text",label:"Case ID",required:true,placeholder:"1234"},
+      {name:"page_size",type:"number",label:"Max alerts",default:100}
+    ]
+  },
+  generate_case_report: {
+    title: "Generate Case Report", icon: "📄",
+    desc: "Generate a full incident report for a case.",
+    fields: [
+      {name:"case_id",type:"text",label:"Case ID",required:true,placeholder:"1234"}
+    ]
+  },
+  merge_cases: {
+    title: "Merge Cases", icon: "🔀",
+    desc: "Merge multiple duplicate cases into one.",
+    fields: [
+      {name:"case_ids",type:"textarea",label:"Case IDs (one per line)",rows:4,required:true,placeholder:"1234\\n5678\\n9012"},
+      {name:"target_case_id",type:"text",label:"Target Case ID (merge INTO)",placeholder:"1234 (leave empty for first)"}
+    ]
+  },
+  bulk_close_cases: {
+    title: "Bulk Close Cases", icon: "✅",
+    desc: "Close multiple cases at once.",
+    fields: [
+      {name:"case_ids",type:"textarea",label:"Case IDs (one per line)",rows:4,required:true,placeholder:"1234\\n5678"},
+      {name:"reason",type:"select",label:"Closure Reason",options:["Resolved","False Positive","Duplicate","Other"]},
+      {name:"comment",type:"text",label:"Closing Comment (optional)"}
+    ]
   }
 };
 
@@ -1953,7 +2503,7 @@ function renderAnalysis(type, data, ms) {
       {name:'secops_list_rules',      method:'GET',   ep:'rules',                     params:'page_size',                ret:'{ rules[] }',                      he:'כל חוקי YARA-L 2.0 במופע.',                 en:'List all YARA-L 2.0 detection rules.'},
       {name:'secops_get_rule',        method:'GET',   ep:'rules/{rule_id}',           params:'rule_id *',                ret:'Full rule + YARA-L source',        he:'שליפת חוק בודד עם קוד מקור מלא.',           en:'Retrieve one rule by ID with full source.'},
       {name:'secops_create_rule',     method:'POST',  ep:'rules',                     params:'rule_text *',              ret:'Created rule object',              he:'יצירת חוק YARA-L חדש (השתמש ב-validate קודם).', en:'Create new YARA-L 2.0 detection rule.'},
-      {name:'secops_validate_rule',   method:'POST',  ep:'rules:verifyRule',          params:'rule_text *',              ret:'{ success, errors[] }',            he:'קומפילציה + בדיקת תחביר ללא שמירה.',         en:'Validate YARA-L syntax without saving.'},
+      {name:'secops_validate_rule',   method:'POST',  ep:':verifyRuleText',           params:'rule_text *',              ret:'{ success } or { compilationDiagnostics[] }', he:'קומפילציה + בדיקת תחביר ללא שמירה.',         en:'Validate YARA-L syntax without saving.'},
       {name:'secops_toggle_rule',     method:'PATCH', ep:'rules/{id}/deployment',     params:'rule_id, enabled, alerting',ret:'Deployment object',               he:'הפעלה/כיבוי חוק והתראות.',                  en:'Enable or disable a rule and alerting.'},
       {name:'secops_list_detections', method:'GET',   ep:'rules/{id}/detections',     params:'rule_id, hours_back',      ret:'{ detections[] }',                 he:'כל הגילויים של חוק ספציפי בטווח זמן.',       en:'List matches for a specific rule in time window.'},
       {name:'secops_list_alerts',     method:'GET',   ep:'legacy:legacySearchDetections', params:'hours_back, state_filter', ret:'{ alerts[] }',                he:'התראות מה-feed (דורש OAuth scope מיוחד).',    en:'List aggregated alerts — needs chronicle-backstory scope.'},
@@ -2452,6 +3002,71 @@ function svgDonut(dataObj, colorArr, size) {
   return '<svg width="' + sz + '" height="' + sz + '" viewBox="0 0 ' + sz + ' ' + sz + '">' + circles + '</svg>';
 }
 
+// ── AI Bot ────────────────────────────────────────────────────────────────────
+function openBot(btn) {
+  document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  document.getElementById('tool-mode').style.display = 'none';
+  var bm = document.getElementById('bot-mode');
+  bm.style.display = 'flex';
+  document.getElementById('bot-input').focus();
+}
+
+function closeBot() {
+  document.getElementById('bot-mode').style.display = 'none';
+  document.getElementById('tool-mode').style.display = 'flex';
+  document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
+}
+
+function sendBotMsg() {
+  var input = document.getElementById('bot-input');
+  var query = input.value.trim();
+  if (!query) return;
+  input.value = '';
+
+  var msgs = document.getElementById('bot-messages');
+  // User bubble
+  msgs.innerHTML += '<div class="bot-msg bot-msg-user"><div class="bot-avatar bot-avatar-user">👤</div>' +
+    '<div class="bot-bubble bot-bubble-user">' + escHtml(query) + '</div></div>';
+
+  // Thinking
+  var thinkId = 'think-' + Date.now();
+  msgs.innerHTML += '<div class="bot-msg" id="' + thinkId + '"><div class="bot-avatar bot-avatar-bot">🧠</div>' +
+    '<div class="bot-bubble bot-bubble-bot"><div class="bot-thinking"><div class="bot-dot"></div><div class="bot-dot"></div><div class="bot-dot"></div></div></div></div>';
+  msgs.scrollTop = msgs.scrollHeight;
+
+  document.getElementById('bot-send-btn').disabled = true;
+
+  fetch('/api/bot', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({query:query})})
+    .then(function(r){return r.json();})
+    .then(function(data) {
+      var el = document.getElementById(thinkId);
+      if (!data.ok) {
+        el.querySelector('.bot-bubble').innerHTML = '<span style="color:var(--red)">❌ ' + escHtml(data.error||'Error') + '</span>';
+      } else {
+        var stepsHtml = '';
+        if (data.steps && data.steps.length) {
+          stepsHtml = '<div class="bot-steps">' + data.steps.map(function(s){
+            return '<span class="bot-step-chip">' + s.tool + '</span>';
+          }).join('') + '</div>';
+        }
+        el.querySelector('.bot-bubble').innerHTML = (data.html||'') + stepsHtml;
+      }
+      msgs.scrollTop = msgs.scrollHeight;
+      document.getElementById('bot-send-btn').disabled = false;
+      document.getElementById('bot-input').focus();
+    })
+    .catch(function(err) {
+      var el = document.getElementById(thinkId);
+      if (el) el.querySelector('.bot-bubble').innerHTML = '<span style="color:var(--red)">❌ ' + err + '</span>';
+      document.getElementById('bot-send-btn').disabled = false;
+    });
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 checkStatus();
 setInterval(checkStatus, 30000);
@@ -2462,8 +3077,16 @@ loadHistory();
 
 
 if __name__ == "__main__":
-    print("\n=== Google SecOps Dashboard ===")
-    print("URL: http://127.0.0.1:5001")
-    print("Project: secops-demo-env")
-    print("Instance: a13f6726-efed-452e-9008-8fe0d3cb0f75\n")
-    app.run(host="127.0.0.1", port=5001, debug=False, threaded=True)
+    import socket
+    port = 5001
+    # Try 5001 first, fall back to 5002 if in use
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if s.connect_ex(("127.0.0.1", port)) == 0:
+            port = 5002
+    print(f"\n=== Google SecOps Dashboard v2 ===")
+    print(f"URL: http://127.0.0.1:{port}")
+    print(f"Tools: 24 (10 original + 6 retrohunts/IOC + 8 cases)")
+    print(f"AI Bot: /api/bot")
+    print(f"Project: {_srv.PROJECT_ID or 'MISSING - set SECOPS_PROJECT_ID in .env (see INSTALL.md)'}")
+    print(f"Instance: {_srv.INSTANCE_ID or 'MISSING - set SECOPS_INSTANCE_ID in .env (see INSTALL.md)'}\n")
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
